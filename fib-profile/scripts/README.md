@@ -18,7 +18,7 @@ From this directory on a four GPU Hopper host:
 docker exec fib-profile bash -lc 'bash /workspace/scripts/entrypoint.sh'
 ```
 
-`entrypoint.sh` creates `/workspace/acc`, installs the mounted bench and its service dependencies, then starts four single GPU backends plus a dispatcher. It pins Torch `2.12.1+cu130`, Triton `3.7.1`, and CuTeDSL `4.6.0` so clean installs use the same profiling runtime. It requires network access to install public packages. Later service restarts reuse that environment:
+`entrypoint.sh` creates `/workspace/acc`, installs the mounted bench and its service dependencies, then starts four single GPU backends plus a dispatcher. It pins Torch `2.12.1+cu130`, Triton `3.7.1`, CuTeDSL `4.6.0`, and CUDA Python `13.0.3` so clean installs use the same profiling runtime. The CUDA Python pin keeps its bindings compatible with CUDA 13.0 drivers during sanitizer checks. It requires network access to install public packages. Later service restarts reuse that environment:
 
 ```bash
 docker exec fib-profile bash -lc 'bash /workspace/scripts/restart_profiling.sh'
