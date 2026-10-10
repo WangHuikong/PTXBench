@@ -20,3 +20,46 @@ experiment root. `SKIP_BUILD=1` reuses already built images. Set
 `PROFILE_BASE_URL` and `GATEWAY_PORT` override the default endpoints. The
 bundled examples target H100 GEMM. Copy a config and update its workload UUID,
 definition, target hardware, and prompt tags for another workload.
+
+## CuTeDSL
+
+The gateway also supports CuTeDSL kernels. Use `language: "cutedsl"` in
+the experiment config and omit `binding`, `nvcc_gencode`, and
+`tvm_ffi_example`. Set `cutedsl_example` to
+`../cutedsl/integration_example.py` when copying a bundled GEMM config,
+and use the `hopper-arch-only` prompt tag to avoid C++ helper headers.
+All config paths are relative to the config file.
+
+Set `cutedsl_source` to a directory containing an exported snapshot of the
+profiling service's installed CuTeDSL sources. The directory must include
+`cutlass/cute/__init__.py` and `source_manifest.json` with this schema:
+
+```json
+{
+  "schema_version": 1,
+  "version": "4.6.0",
+  "packages": {"nvidia-cutlass-dsl": "4.6.0"},
+  "files": {"cutlass/cute/__init__.py": "<SHA-256 of the file>"}
+}
+```
+
+Include every exported file's relative path and SHA-256 in `files`; omit
+compiled libraries and symlinks. The launcher validates the snapshot,
+records its version and hashes, and mounts it read-only at
+`/workspace/cutedsl` for source inspection. Preparation and launch reject
+changes to the source snapshot or integration example in an existing run.
+
+The agent writes a self-contained `kernel.py` with a destination-passing
+`run(...)`: definition inputs followed by preallocated outputs, in definition
+order. Submit it with:
+
+```bash
+ptxbench-eval /workspace/kernel.py /opt/ptxbench/workload.json
+```
+
+The fixed MCP evaluator selects the same Python file automatically. The
+gateway checks Python syntax without executing it, then submits
+`language: "python"`, `kernel.py::run`, and the CuTeDSL dependencies to the
+profiling service for JIT compilation, sanitization, and benchmarking.
+The service must have `nvidia-cutlass-dsl` and `cuda-python` installed;
+`fib-profile/scripts/entrypoint.sh` installs them on a fresh setup.

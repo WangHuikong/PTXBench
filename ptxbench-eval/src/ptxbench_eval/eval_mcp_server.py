@@ -20,6 +20,11 @@ EVALUATOR_CWD = "/workspace"
 EVALUATOR_TIMEOUT_SECONDS = 930
 
 
+def _evaluator_command() -> list[str]:
+    command = list(EVALUATOR_COMMAND)
+    if os.environ.get("PTXBENCH_KERNEL_LANGUAGE") == "cutedsl":
+        command[1] = "/workspace/kernel.py"
+    return command
 EVALUATOR_ENVIRONMENT_KEYS = (
     "PTXBENCH_RUN_ID",
     "PTXBENCH_EVAL_EXCHANGE_DIR",
@@ -55,7 +60,7 @@ def _evaluate_kernel() -> dict[str, Any]:
 
     try:
         completed = subprocess.run(
-            list(EVALUATOR_COMMAND),
+            _evaluator_command(),
             cwd=EVALUATOR_CWD,
             env=environment,
             stdout=subprocess.PIPE,
@@ -119,7 +124,7 @@ def _handle_request(request: dict[str, Any]) -> dict[str, Any] | None:
                     {
                         "name": "evaluate_kernel",
                         "description": (
-                            f"Evaluate {EVALUATOR_COMMAND[1]} against the fixed "
+                            f"Evaluate {_evaluator_command()[1]} against the fixed "
                             "PTXBench workload and return compiler, correctness, "
                             "and performance feedback. Takes no arguments and "
                             "waits for the complete result."

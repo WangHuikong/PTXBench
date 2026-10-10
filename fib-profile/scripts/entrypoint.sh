@@ -25,7 +25,7 @@ source "$VENV_DIR/bin/activate"
 uv pip install --index-strategy unsafe-best-match \
     --extra-index-url https://download.pytorch.org/whl/cu130 \
     -e "$BENCH_ROOT[serve]" httpx cupti-python "flash-linear-attention==0.5.2" \
-    "torch==2.12.1+cu130" "triton==3.7.1"
+    "torch==2.12.1+cu130" "triton==3.7.1" "nvidia-cutlass-dsl==4.6.0" cuda-python
 python - <<'PY'
 import torch
 import triton

@@ -15,6 +15,7 @@ from urllib.parse import quote
 
 import requests
 
+from .cutedsl import source_snapshot
 from .eval_exchange import EvalExchangeBroker
 from .feedback import feedback_style_from_config
 from .models import WorkloadManifest, normalized_usage, validate_language_contract
@@ -272,6 +273,8 @@ def _materialize_prompt_context(
     workspace: Path,
     sources: list[tuple[str, Path]],
     example_source_path: Path | None,
+    *,
+    language: str = "cuda",
 ) -> dict[str, Any]:
     markdown_sources = [item for item in sources if item[1].suffix.lower() == ".md"]
     header_sources = [item for item in sources if item[1].suffix.lower() == ".h"]
@@ -279,6 +282,10 @@ def _materialize_prompt_context(
     knowledge = markdown.rstrip() + "\n"
     if example_source_path is not None:
         example_intro = (
+            "\n\n## CuTeDSL integration example\n\n"
+            "Follow this destination-passing wrapper, DLPack conversion, dynamic-layout "
+            "marking, CUDA stream handling, and compile-once/execute-many pattern.\n\n```python\n"
+            if language == "cutedsl" else
             "\n\n## Required TVM-FFI wrapper example\n\n"
             "Use this exact registration and destination-passing pattern.\n\n```cpp\n"
         )
@@ -320,11 +327,26 @@ def _materialize_prompt_context(
         ],
     }
     if example_source_path is not None:
+        example_key = "cutedsl_example" if language == "cutedsl" else "tvm_ffi_example"
         result.update({
-            "tvm_ffi_example_sha256": _sha256_text(example_source_path.read_text()),
-            "tvm_ffi_example_source": str(example_source_path),
+            f"{example_key}_sha256": _sha256_text(example_source_path.read_text()),
+            f"{example_key}_source": str(example_source_path),
         })
     return result
+
+
+def _cutedsl_source(config: dict[str, Any]) -> dict[str, Any] | None:
+    if config.get("language") != "cutedsl":
+        return None
+    path = _resolve(config, _required_config_string(config, "cutedsl_source")).resolve()
+    return source_snapshot(path)
+
+
+def _cutedsl_mount_args(config: dict[str, Any]) -> list[str]:
+    if config.get("language") != "cutedsl":
+        return []
+    path = _resolve(config, _required_config_string(config, "cutedsl_source")).resolve()
+    return ["-v", f"{path}:/workspace/cutedsl:ro"]
 
 
 def _agent_kind(config: dict[str, Any]) -> str:
@@ -513,6 +535,8 @@ def _agent_prompt(
     target_speedup: float | int | None,
     evaluation_via_mcp: bool = False,
     task_view: str = "full",
+    language: str = "cuda",
+    cutedsl_version: str | None = None,
 ) -> str:
     task_view = validate_task_view(task_view)
     goal_instructions = _goal_instructions(target_speedup)
@@ -546,6 +570,27 @@ Create and work in /workspace/kernel.cu. The GPU architecture knowledge and the 
 The headers and wrapper example are reference material. Keep kernel.cu self-contained and not rely on these local helper files because only kernel.cu is submitted and the evaluation environment doesn't have those local heeader files in /workspace.
 You must optimize the CUDA kernels with architecure-specific PTX instructions. Naive for-loop kernels are not acceptable."""
     environment_instructions = "The current environment doesn't have any CUDA related software."
+    if language == "cutedsl":
+        evaluation_instructions = evaluation_instructions.replace("kernel.cu", "kernel.py")
+        implementation_instructions = f"""Your task is to implement an optimized CuTeDSL kernel in /workspace/kernel.py.
+Define a Python `run` function receiving all definition inputs followed by all
+preallocated definition outputs, each in definition order. Write results into
+those outputs without allocating or replacing them. Use CuTeDSL for GPU computation;
+PyTorch may provide tensor views and the current stream, but must not compute the result.
+
+GPU architecture knowledge and a CuTeDSL integration example are in
+/workspace/knowledge_pack.md. The CuTeDSL
+{cutedsl_version or 'service-matched'} source is mounted read-only at /workspace/cutedsl.
+Keep kernel.py self-contained: only that file is submitted. In the submitted
+kernel, import cutlass and cuda normally; those packages are installed in the
+profiling service. The local CuTeDSL snapshot is for source inspection only and
+cannot be imported in this agent environment because its compiled runtime libraries
+are absent.
+Use architecture-specific CuTeDSL operations to optimize the kernel."""
+        environment_instructions = (
+            "This is a CPU-only agent environment. CuTeDSL JIT compilation and GPU execution "
+            "happen in the profiling service through the provided evaluator."
+        )
     return f"""{goal_instructions}
 
 Do not write or edit any code before reading `/opt/ptxbench/workload.json` completely.
@@ -564,6 +609,7 @@ Keep optimizing after correctness.
 
 def prepare(config: dict[str, Any]) -> Registry:
     validate_language_contract(config)
+    cutedsl_source = _cutedsl_source(config)
     feedback_style = feedback_style_from_config(config)
     task_view = task_view_from_config(config)
     agent = _agent_kind(config)
@@ -586,7 +632,8 @@ def prepare(config: dict[str, Any]) -> Registry:
     if not isinstance(prompt_root_value, str) or not prompt_root_value.strip():
         raise ValueError("prompt_files_root is required")
     prompt_root = _resolve(config, prompt_root_value).resolve()
-    example_value = _required_config_string(config, "tvm_ffi_example")
+    example_key = "cutedsl_example" if config["language"] == "cutedsl" else "tvm_ffi_example"
+    example_value = _required_config_string(config, example_key)
     example_source_path = _resolve(config, example_value).resolve()
     example_source = example_source_path.read_text()
     manifests: dict[tuple[str, str, str], WorkloadManifest] = {}
@@ -606,6 +653,8 @@ def prepare(config: dict[str, Any]) -> Registry:
                 target_speedup=manifest.data.get("target_speedup"),
                 evaluation_via_mcp=(codex_use_mcp if agent == "codex" else disable_web),
                 task_view=task_view,
+                language=config["language"],
+                cutedsl_version=cutedsl_source["version"] if cutedsl_source else None,
             ),
             add_goal_command=add_goal_command,
             disable_web=disable_web,
@@ -648,6 +697,8 @@ def prepare(config: dict[str, Any]) -> Registry:
             if existing.get("model") != config["model"]:
                 raise ValueError(f"existing run {run_id} has a different model")
             existing_provenance = existing.get("artifact_provenance") or {}
+            if existing_provenance.get("cutedsl_source") != cutedsl_source:
+                raise ValueError(f"existing run {run_id} has different CuTeDSL source")
             expected_context_files = [
                 {
                     "path": relative,
@@ -674,10 +725,11 @@ def prepare(config: dict[str, Any]) -> Registry:
                     raise ValueError(
                         f"existing run {run_id} has different extra user-prompt files"
                     )
-            if existing_provenance.get("tvm_ffi_example_sha256") != _sha256_text(
+            if existing_provenance.get(f"{example_key}_sha256") != _sha256_text(
                 example_source
             ):
-                raise ValueError(f"existing run {run_id} has a different TVM-FFI example")
+                example_label = "CuTeDSL" if config["language"] == "cutedsl" else "TVM-FFI"
+                raise ValueError(f"existing run {run_id} has a different {example_label} example")
             token_path = registry.root / "secrets" / f"{run_id}.token"
             env_path = registry.root / "secrets" / f"{run_id}.env"
             if token_path.exists() and not env_path.exists():
@@ -689,8 +741,11 @@ def prepare(config: dict[str, Any]) -> Registry:
         workspace = registry.root / "workspaces" / run_id
         workspace.mkdir(parents=True, exist_ok=True)
         context_provenance = _materialize_prompt_context(
-            workspace, context_sources, example_source_path
+            workspace, context_sources, example_source_path, language=config["language"]
         )
+        if cutedsl_source is not None:
+            (workspace / "cutedsl").mkdir(exist_ok=True)
+            context_provenance["cutedsl_source"] = cutedsl_source
         context_provenance.update(
             {
                 "prompt_hub_sha256": _sha256_text(hub_path.read_text()),
@@ -776,7 +831,10 @@ def prepare(config: dict[str, Any]) -> Registry:
                     / "agent.md"
                 )
                 agent_definition.parent.mkdir(parents=True, exist_ok=True)
-                agent_definition.write_text(_agy_no_web_agent_definition())
+                definition = _agy_no_web_agent_definition()
+                if config["language"] == "cutedsl":
+                    definition = definition.replace("kernel.cu", "kernel.py")
+                agent_definition.write_text(definition)
         token = registry.create_run(
             run_id=run_id,
             manifest=manifest.data,
@@ -821,6 +879,11 @@ def _registry_for_launch(config: dict[str, Any]) -> Registry:
     """Reuse a prepared, config-identical experiment without re-querying it."""
 
     validate_language_contract(config)
+    cutedsl_source = _cutedsl_source(config)
+    cutedsl_example_sha256 = None
+    if config.get("language") == "cutedsl":
+        example_path = _resolve(config, _required_config_string(config, "cutedsl_example"))
+        cutedsl_example_sha256 = _sha256_text(example_path.read_text())
     feedback_style = feedback_style_from_config(config)
     task_view = task_view_from_config(config)
     root = Path(config["experiment_root"]).expanduser().resolve()
@@ -851,6 +914,10 @@ def _registry_for_launch(config: dict[str, Any]) -> Registry:
             )
         snapshot = WorkloadManifest.parse(read_json(registry.manifest_path(run_id)))
         run_record = registry.get_run(run_id)
+        if (run_record.get("artifact_provenance") or {}).get("cutedsl_source") != cutedsl_source:
+            raise ValueError(f"prepared run {run_id} has different CuTeDSL source")
+        if (run_record.get("artifact_provenance") or {}).get("cutedsl_example_sha256") != cutedsl_example_sha256:
+            raise ValueError(f"prepared run {run_id} has a different CuTeDSL example")
         if run_record.get("task_view", "full") != task_view:
             raise ValueError(f"prepared run {run_id} has a different task_view")
         if run_record.get("feedback_style", "default") != feedback_style:
@@ -869,7 +936,7 @@ def _registry_for_launch(config: dict[str, Any]) -> Registry:
             expected_instruction = (
                 "`ptxbench-eval` MCP server's `evaluate_kernel` tool"
                 if codex_use_mcp
-                else "`ptxbench-eval /workspace/kernel.cu /opt/ptxbench/workload.json`"
+                else f"`ptxbench-eval /workspace/{'kernel.py' if snapshot.data['language'] == 'cutedsl' else 'kernel.cu'} /opt/ptxbench/workload.json`"
             )
             if expected_instruction not in prompt:
                 mode = "MCP" if codex_use_mcp else "native command-line"
@@ -1129,6 +1196,7 @@ def _evaluator_container_args(
 ) -> list[str]:
     if _uses_eval_exchange(config):
         return [
+            *(["-e", "PTXBENCH_KERNEL_LANGUAGE=cutedsl"] if config.get("language") == "cutedsl" else []),
             "-e",
             f"PTXBENCH_RUN_ID={run_id}",
             "-e",
@@ -1225,6 +1293,7 @@ def _launch_one(config: dict[str, Any], registry: Registry, run: dict[str, Any])
         *evaluator_args,
         "-v",
         f"{workspace}:/workspace",
+        *_cutedsl_mount_args(config),
         "-v",
         f"{workload}:/opt/ptxbench/workload.json:ro",
         "-v",
